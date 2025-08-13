@@ -958,6 +958,37 @@ class Nemesis(NemesisFlags):
 
         return sstables
 
+    def get_all_sstables_files(self, tables: list[str] = None, node: BaseNode = None):
+        node = node or self.target_node
+        target_tables = tables or self.cluster.get_non_system_ks_cf_list(db_node=node)
+
+        sstable_files = []
+        for ks_cf in target_tables:
+            sstable_util = SstableUtils(db_node=node, ks_cf=ks_cf)
+            ks_cf_sstable_files = sstable_util.get_all_sstables_files()
+            sstable_files.extend(ks_cf_sstable_files)
+
+        self.log.debug("All Sstable files are: %s", sstable_files)
+        return sstable_files
+
+    def get_all_quarantined_sstables(self, tables: list[str] = None, node: BaseNode = None):
+        """
+        :param tables: list of tables. Format of name: <keyspace_name.table_name>. If not specified, all tables will be used.
+        :param node: get SStables from the node
+        """
+        node = node or self.target_node
+        target_tables = tables or self.cluster.get_non_system_ks_cf_list(db_node=node)
+
+        sstables = []
+        for ks_cf in target_tables:
+            sstable_util = SstableUtils(db_node=node, ks_cf=ks_cf)
+            ks_cf_sstables = sstable_util.get_quarantined_sstables()
+            sstables.extend(ks_cf_sstables)
+
+        self.log.debug("All quarantined Sstables are: %s", sstables)
+
+        return sstables
+
     @decorate_with_context([ignore_ycsb_connection_refused, ignore_raft_topology_cmd_failing])
     def _destroy_data_and_restart_scylla(self, keyspaces_for_destroy: list = None, sstables_to_destroy_perc: int = 50):
         tables = self.cluster.get_non_system_ks_cf_list(db_node=self.target_node, filter_empty_tables=False,
@@ -4125,13 +4156,43 @@ class Nemesis(NemesisFlags):
         if not ks_cfs:
             raise UnsupportedNemesis(
                 'Non-system keyspace and table are not found. Nemesis can\'t be run')
-
         # Corrupt data file
         data_file_pattern = self._choose_file_for_destroy(ks_cfs)
+        self.log.info(f"Corruption of sstables")
         res = self.target_node.remoter.run('sudo find {}-Data.db'.format(data_file_pattern))
         for sstable_file in res.stdout.split():
+            self.log.info(f"Corrupting file: {sstable_file}")
             self.target_node.remoter.run('sudo dd if=/dev/urandom of={} count=1024'.format(sstable_file))
             self.log.debug('File {} was corrupted by dd'.format(sstable_file))
+
+    def _corrupt_data_files_for_tables(self, ks_cfs, max_sstables_per_table):
+        """Corrupt data files for specific keyspace.table combinations"""
+        for ks_cf in ks_cfs:
+            try:
+                sstable_util = SstableUtils(db_node=self.target_node, ks_cf=ks_cf)
+                sstables_to_corrupt = sstable_util.get_sstables(num_sstables=max_sstables_per_table)
+                self.log.info(f"Selected sstables for corruption: {sstables_to_corrupt}")
+
+                if not sstables_to_corrupt:
+                    self.log.warning(f"No sstables found for {ks_cf}")
+                    continue
+
+                for sstable_file in sstables_to_corrupt:
+                    self.target_node.remoter.run(f'sudo dd if=/dev/urandom of={sstable_file} count=1024')
+                    self.log.info(f'File {sstable_file} was corrupted by dd')
+
+            except Exception as exc:
+                self.log.warning(f"Failed to corrupt sstables for {ks_cf}: {exc}")
+
+    def disable_autocompaction(self, node: BaseNode = None):
+        node = node or self.target_node
+        compaction_ops = CompactionOps(cluster=self.cluster)
+        compaction_ops.disable_autocompaction_on_ks_cf(node=node)
+
+    def enable_autocompaction(self, node: BaseNode = None):
+        node = node or self.target_node
+        compaction_ops = CompactionOps(cluster=self.cluster)
+        compaction_ops.enable_autocompaction_on_ks_cf(node=node)
 
     @target_data_nodes
     def disrupt_corrupt_then_scrub(self):
@@ -4145,6 +4206,76 @@ class Nemesis(NemesisFlags):
                 self.target_node.run_nodetool("scrub", args=f"--skip-corrupted {ks}")
 
         self.clear_snapshots()
+
+    @target_data_nodes
+    def disrupt_corrupt_then_drop_quarantined(self):
+        """Corrupt sstables, run scrub to quarantine them, then drop quarantined sstables."""
+        # ks_cfs = self.cluster.get_non_system_ks_cf_list(db_node=self.target_node)
+        # if not ks_cfs:
+        #     raise UnsupportedNemesis(
+        #         'Non-system keyspace and table are not found. Nemesis can\'t be run')
+
+        # selected_ks_cfs = random.sample(ks_cfs, min(5, len(ks_cfs)))
+        # self.log.info(f"Selected keyspaces and tables for corruption: {selected_ks_cfs}")
+
+        # self.log.info("Flushing selected keyspaces and tables")
+        # with adaptive_timeout(Operations.FLUSH, self.target_node, timeout=HOUR_IN_SEC * 2):
+        #     # for ks_cf in selected_ks_cfs:
+        #         # keyspace, table = ks_cf.split('.')
+        #         # self.target_node.run_nodetool("flush", args=f"{keyspace} {table}")
+        #     self.target_node.run_nodetool("flush")
+
+        # self.log.info("Disabling autocompaction before corruption")
+        # self.disable_autocompaction()
+
+        # self._corrupt_data_files_for_tables(selected_ks_cfs, 3)
+        # self._corrupt_data_file()
+
+        # with ignore_scrub_invalid_errors(), adaptive_timeout(Operations.SCRUB, self.target_node, timeout=HOUR_IN_SEC * 48):
+        #     # for ks_cf in selected_ks_cfs:
+        #     #     keyspace, table = ks_cf.split('.')
+        #         # self.target_node.run_nodetool("scrub", args=f"--mode=VALIDATE {keyspace} {table}")
+        #     self.log.info("Running scrub with VALIDATE mode")
+        #     self.target_node.run_nodetool("scrub", args=f"--mode=VALIDATE --no-snapshot")
+
+        # self.log.info("Scrub completed, enabling autocompaction")
+        # self.enable_autocompaction()
+
+        # quarantined_before = self.get_all_quarantined_sstables()
+        # self.log.info("Quarantined sstables before drop: %s", quarantined_before)
+        # assert quarantined_before, "Expected quarantined sstables after corruption and scrub, but found none."
+
+        # print all sstables before drop
+        sstables = self.get_all_sstables_files()
+        self.log.info("SSTables before scrub: %s", sstables)
+        # self.log.info("Dropping quarantined sstables")
+        # self.target_node.run_nodetool("dropquarantinedsstables")
+
+        with ignore_scrub_invalid_errors(), adaptive_timeout(Operations.SCRUB, self.target_node, timeout=HOUR_IN_SEC * 48):
+            # for ks_cf in selected_ks_cfs:
+            #     keyspace, table = ks_cf.split('.')
+                # self.target_node.run_nodetool("scrub", args=f"--mode=VALIDATE {keyspace} {table}")
+            # self.log.info("Running scrub with VALIDATE mode")
+            for ks in self.cluster.get_test_keyspaces():
+                self.target_node.run_nodetool("scrub", args=f"--mode=VALIDATE --no-snapshot {ks}")
+        time.sleep(120)
+
+        # self.log.info("Quarantined sstables after drop: %s", quarantined_after)
+        sstables = self.get_all_sstables_files()
+        self.log.info("SSTables after scrub: %s", sstables)
+        quarantined_after = self.get_all_quarantined_sstables()
+        assert not quarantined_after, f"Expected no quarantined sstables after drop, but found: {quarantined_after}"
+
+    # @target_data_nodes
+    # def disrupt_validate(self):
+    #     """Corrupt sstables, run scrub to quarantine them, then drop quarantined sstables."""
+    #     with ignore_scrub_invalid_errors(), adaptive_timeout(Operations.SCRUB, self.target_node, timeout=HOUR_IN_SEC * 48):
+    #         self.log.info("Running scrub with VALIDATE mode")
+    #         for ks in self.cluster.get_test_keyspaces():
+    #             self.target_node.run_nodetool("scrub", args=f"--mode=VALIDATE --no-snapshot {ks}")
+
+    #     quarantined_after = self.get_all_quarantined_sstables()
+    #     assert not quarantined_after, f"Expected no quarantined sstables after drop, but found: {quarantined_after}"
 
     @latency_calculator_decorator(legend="Adding new nodes")
     def add_new_nodes(self, count, rack=None, instance_type: str = None) -> list[BaseNode]:
@@ -6807,3 +6938,14 @@ class IsolateNodeWithIptableRuleNemesis(Nemesis):
 
     def disrupt(self):
         self.disrupt_refuse_connection_with_block_scylla_ports_on_banned_node()
+
+
+class DropQuarantinedSStableMonkey(Nemesis):
+    """
+    Nemesis that corrupts sstables, runs scrub to quarantine them, then drops quarantined sstables
+    """
+    disruptive = False
+    supports_high_disk_utilization = False
+
+    def disrupt(self):
+        self.disrupt_corrupt_then_drop_quarantined()

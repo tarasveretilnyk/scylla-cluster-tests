@@ -259,6 +259,18 @@ def ignore_scrub_invalid_errors():
             db_event=DatabaseLogEvent.DATABASE_ERROR,
             line="Skipping invalid partition",
         ))
+        stack.enter_context(DbEventsFilter(
+            db_event=DatabaseLogEvent.DATABASE_ERROR,
+            line="there are invalid sstables",
+        ))
+        stack.enter_context(DbEventsFilter(
+            db_event=DatabaseLogEvent.DATABASE_ERROR,
+            line="No such file or directory"
+        ))
+        stack.enter_context(DbEventsFilter(
+            db_event=DatabaseLogEvent.DATABASE_ERROR,
+            line="file not found"
+        ))
         yield
 
 

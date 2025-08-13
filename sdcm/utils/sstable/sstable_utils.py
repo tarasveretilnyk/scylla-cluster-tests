@@ -42,12 +42,14 @@ class SstableUtils:
         self.log.debug('Got %s tombstones for %s', tombstones_num, self.ks_cf)
         return tombstones_num
 
-    def get_sstables(self, from_minutes_ago: int = 0):
+    def get_sstables(self, from_minutes_ago: int = 0, num_sstables: int = 0) -> list:
         selected_sstables = []
         ks_cf_path = self.ks_cf.replace('.', '/')
         find_cmd = f"find /var/lib/scylla/data/{ks_cf_path}-*/*-big-Data.db -maxdepth 1 -type f"
         if from_minutes_ago:
             find_cmd += f" -cmin -{from_minutes_ago}"
+        if num_sstables:
+            find_cmd += f" | head -n {num_sstables}"
         sstables_res = self.db_node.remoter.sudo(find_cmd, verbose=True, ignore_status=True)
         if sstables_res.stderr:
             self.log.debug('Failed to get sstables for %s. Error: %s', self.ks_cf, sstables_res.stderr)
@@ -57,6 +59,33 @@ class SstableUtils:
         message = f'filtered by last {from_minutes_ago} minutes' if from_minutes_ago else '(not filtered by time)'
         self.log.debug('Got %s sstables %s', len(selected_sstables), message)
         return selected_sstables
+
+    def get_all_sstables_files(self) -> list:
+        selected_sstables = []
+        ks_cf_path = self.ks_cf.replace('.', '/')
+        find_cmd = f"find /var/lib/scylla/data/{ks_cf_path}-*/ -maxdepth 1 -type f"
+        sstables_res = self.db_node.remoter.sudo(find_cmd, verbose=True, ignore_status=True)
+        if sstables_res.stderr:
+            self.log.debug('Failed to get all sstables for %s. Error: %s', self.ks_cf, sstables_res.stderr)
+        else:
+            selected_sstables = sstables_res.stdout.split()
+
+        self.log.debug('Got %s sstables for %s', len(selected_sstables), self.ks_cf)
+        return selected_sstables
+
+    def get_quarantined_sstables(self) -> list:
+        quarantined_sstables = []
+        ks_cf_path = self.ks_cf.replace('.', '/')
+        find_cmd = f"find /var/lib/scylla/data/{ks_cf_path}-*/quarantine/*-big-Data.db -maxdepth 1 -type f"
+
+        sstables_res = self.db_node.remoter.sudo(find_cmd, verbose=True, ignore_status=True)
+        if sstables_res.stderr:
+            self.log.debug('Failed to get quarantined sstables for %s. Error: %s', self.ks_cf, sstables_res.stderr)
+        else:
+            quarantined_sstables = sstables_res.stdout.split()
+
+        self.log.debug('Got %s quarantined sstables for %s', len(quarantined_sstables), self.ks_cf)
+        return quarantined_sstables
 
     def check_that_sstables_are_encrypted(self, sstables=None,
                                           expected_bool_value: bool = True) -> list:
