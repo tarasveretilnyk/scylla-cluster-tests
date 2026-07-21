@@ -18,6 +18,7 @@ from enum import StrEnum
 
 from longevity_test import LongevityTest
 from sdcm.sct_events.system import InfoEvent
+from sdcm.utils.cluster_tools import group_nodes_by_dc_idx
 from sdcm.utils.tablets.common import wait_tablets_balanced
 from sdcm.wait import wait_for
 
@@ -107,8 +108,18 @@ class VnodeToTabletMigrationTest(LongevityTest):
                     f"[ks={ks}] Expected {NodeMigrationStatus.USES_VNODES!r} for {node.host_id}, got {migration_status[node.host_id]!r}"
                 )
 
-        InfoEvent(message="Step 4 - Rolling restart with migrate-to-tablets upgrade").publish()
-        for node in self.db_cluster.data_nodes:
+        InfoEvent(message="Step 4 - Rolling restart with migrate-to-tablets upgrade (round-robin across DCs)").publish()
+        nodes_by_dc = group_nodes_by_dc_idx(self.db_cluster.data_nodes)
+        dc_indices = sorted(nodes_by_dc)
+        # Interleave nodes across DCs: DC0[0], DC1[0], DC0[1], DC1[1], ...
+        max_nodes = max(len(nodes_by_dc[dc]) for dc in dc_indices)
+        interleaved_nodes = [
+            nodes_by_dc[dc][i]
+            for i in range(max_nodes)
+            for dc in dc_indices
+            if i < len(nodes_by_dc[dc])
+        ]
+        for node in interleaved_nodes:
             wait_for(
                 func=lambda n=node: not n.running_nemesis,
                 step=30,
@@ -116,7 +127,7 @@ class VnodeToTabletMigrationTest(LongevityTest):
                 text=f"Waiting for nemesis on {node.name} to finish before upgrade",
             )
             with self.nemesis_allocator.nodes_running_nemesis(node, "vnode_to_tablet_migration"):
-                self.log.info("Preparing node %s (ip=%s) for tablet migration", node.name, node.ip_address)
+                self.log.info("Preparing node %s (dc=%s, ip=%s) for tablet migration", node.name, node.dc_idx, node.ip_address)
                 node.run_nodetool("migrate-to-tablets upgrade")
                 self.log.info("Verify that the node status changed from vnodes to migrating to tablets")
                 for ks in keyspaces:

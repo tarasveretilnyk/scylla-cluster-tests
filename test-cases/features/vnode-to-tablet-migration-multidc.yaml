@@ -1,0 +1,36 @@
+test_duration: 180
+
+n_db_nodes: '3 3'
+n_loaders: '1 1'
+instance_type_db: 'i4i.2xlarge'
+instance_type_loader: 'c6i.xlarge'
+
+user_prefix: 'vnode-to-tablet-migration-multidc'
+
+# Start with vnodes - tablets are disabled so all keyspaces are created with vnodes
+append_scylla_yaml:
+  enable_tablets: false
+  tablets_mode_for_new_keyspaces: 'disabled'
+
+endpoint_snitch: GossipingPropertyFileSnitch
+
+prepare_write_cmd:
+  - >-
+    cassandra-stress write cl=LOCAL_QUORUM n=1000000
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)
+    compaction(strategy=SizeTieredCompactionStrategy)'
+    -port jmx=6868 -mode cql3 native -rate threads=80
+    -pop seq=1..1000000 -col 'n=FIXED(5) size=FIXED(256)' -log interval=5
+
+stress_cmd:
+  - >-
+    cassandra-stress mixed cl=LOCAL_QUORUM duration=120m
+    -schema 'replication(strategy=NetworkTopologyStrategy,replication_factor=3)
+    compaction(strategy=SizeTieredCompactionStrategy)'
+    -port jmx=6868 -mode cql3 native -rate threads=40
+    -pop 'dist=uniform(1..1000000)' -col 'n=FIXED(5) size=FIXED(256)'
+    -log interval=5 -errors retries=50
+
+nemesis_class_name: 'NoOpMonkey'
+
+round_robin: true
