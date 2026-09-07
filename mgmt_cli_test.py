@@ -52,6 +52,7 @@ from sdcm.utils.adaptive_timeouts import adaptive_timeout, Operations
 from sdcm.utils.alternator.table_setup import alternator_backuped_tables
 from sdcm.utils.aws_utils import AwsIAM
 from sdcm.utils.features import is_tablets_feature_enabled
+from sdcm.utils.database_query_utils import is_system_keyspace
 from sdcm.utils.common import reach_enospc_on_node, clean_enospc_on_node
 from sdcm.utils.time_utils import ExecutionTimer
 from sdcm.mgmt.operations import ManagerTestFunctionsMixIn, SnapshotData
@@ -1432,6 +1433,41 @@ class ManagerRestoreBenchmarkTests(ManagerTestFunctionsMixIn):
 
         self.run_verification_read_stress()
 
+    def _pin_tablet_count(self) -> None:
+        """Freeze every user table's tablet count so the balancer cannot resize during the restore.
+
+        max_tablet_count is applied last in the allocator, as a cap that overrides every other sizing factor,
+        so no split decision can be emitted. That in turn rules out the sstable split-on-attach work a split
+        would trigger - relevant when benchmarking load-and-stream, where a mid-restore resize would otherwise
+        confound the measurement. min_tablet_count is set to the same value to block merges too.
+
+        Tables are discovered from system.tablets rather than from the snapshot's ks_tables_map, because the
+        snapshot definitions carry the keyspace name the dataset was *generated* with (e.g. 'keyspace1') which
+        need not match the keyspace actually present after a schema restore.
+
+        Must run after the schema restore and before the data restore, so the cap covers the whole
+        load-and-stream phase.
+        """
+        with self.db_cluster.cql_connection_patient(self.db_cluster.nodes[0]) as session:
+            # keyspace_name, table_name and tablet_count are static columns, so this yields one row per table.
+            rows = list(session.execute("SELECT keyspace_name, table_name, tablet_count FROM system.tablets"))
+            targets = [
+                (r.keyspace_name, r.table_name, r.tablet_count)
+                for r in rows
+                if r.keyspace_name and not is_system_keyspace(r.keyspace_name) and r.tablet_count
+            ]
+            if not targets:
+                self.log.warning("No tablet-enabled user tables found in system.tablets - nothing to pin")
+                return
+            for ks_name, table_name, tablet_count in targets:
+                # Identifiers are quoted: these names come verbatim from system.tablets and the benchmark
+                # keyspaces start with a digit (e.g. 2048gb_...), which is not a valid bare CQL identifier.
+                session.execute(
+                    f'ALTER TABLE "{ks_name}"."{table_name}" WITH tablets = '
+                    f"{{'min_tablet_count': {tablet_count}, 'max_tablet_count': {tablet_count}}}"
+                )
+                self.log.info("Pinned %s.%s at %s tablets", ks_name, table_name, tablet_count)
+
     def test_restore_from_precreated_backup(
         self,
         snapshot_name: str,
@@ -1476,6 +1512,9 @@ class ManagerRestoreBenchmarkTests(ManagerTestFunctionsMixIn):
             restore_schema=True,
             location_list=locations,
         )
+
+        self.log.info("Pinning tablet counts so the balancer cannot resize during the restore")
+        self._pin_tablet_count()
 
         if restore_outside_manager:
             self.log.info("Restoring the data outside the Manager")
